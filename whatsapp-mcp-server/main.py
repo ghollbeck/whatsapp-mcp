@@ -1,3 +1,5 @@
+import os
+import logging
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -14,6 +16,38 @@ from whatsapp import (
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
+
+# Security logging
+logger = logging.getLogger("whatsapp-mcp-go")
+
+# Security: allowed recipients from env var
+DEFAULT_ALLOWED = "491732328586@s.whatsapp.net,1732328586@s.whatsapp.net"
+ALLOWED_RAW = os.environ.get("WHATSAPP_MCP_ALLOWED_RECIPIENT", DEFAULT_ALLOWED)
+ALLOWED_JIDS = set(jid.strip() for jid in ALLOWED_RAW.split(",") if jid.strip())
+
+logger.info(f"[SECURITY] Send message policy: ONLY allowed to [{ALLOWED_RAW}], NO group chats")
+
+
+def _check_recipient_allowed(recipient: str) -> tuple[bool, str | None]:
+    """Check if a recipient is in the allowed list. Returns (allowed, error_message)."""
+    normalized = recipient
+    if "@" not in normalized:
+        normalized = f"{normalized}@s.whatsapp.net"
+
+    # Block group chats
+    if normalized.endswith("@g.us"):
+        msg = f"[SECURITY] BLOCKED: Group chat send attempt to {normalized}"
+        logger.warning(msg)
+        return False, f"Sending to group chats is not allowed. Attempted: {normalized}"
+
+    # Check against allowed JIDs
+    if normalized not in ALLOWED_JIDS:
+        msg = f"[SECURITY] BLOCKED: Unauthorized recipient {normalized}. Allowed: {ALLOWED_JIDS}"
+        logger.warning(msg)
+        return False, f"Recipient {normalized} is not in the allowed list. Only authorized recipients can receive messages."
+
+    return True, None
+
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
@@ -175,7 +209,14 @@ def send_message(
             "success": False,
             "message": "Recipient must be provided"
         }
-    
+
+    # Security check
+    allowed, error = _check_recipient_allowed(recipient)
+    if not allowed:
+        return {"success": False, "message": error}
+
+    logger.info(f"[SECURITY] ALLOWED: Sending message to {recipient}")
+
     # Call the whatsapp_send_message function with the unified recipient parameter
     success, status_message = whatsapp_send_message(recipient, message)
     return {
@@ -195,7 +236,13 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     Returns:
         A dictionary containing success status and a status message
     """
-    
+    # Security check
+    allowed, error = _check_recipient_allowed(recipient)
+    if not allowed:
+        return {"success": False, "message": error}
+
+    logger.info(f"[SECURITY] ALLOWED: Sending file to {recipient}")
+
     # Call the whatsapp_send_file function
     success, status_message = whatsapp_send_file(recipient, media_path)
     return {
@@ -215,6 +262,13 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     Returns:
         A dictionary containing success status and a status message
     """
+    # Security check
+    allowed, error = _check_recipient_allowed(recipient)
+    if not allowed:
+        return {"success": False, "message": error}
+
+    logger.info(f"[SECURITY] ALLOWED: Sending audio to {recipient}")
+
     success, status_message = whatsapp_audio_voice_message(recipient, media_path)
     return {
         "success": success,
