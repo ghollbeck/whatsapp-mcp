@@ -19,19 +19,18 @@ class DaemonConfig(BaseModel):
     port: int = 8084
 
 
-class LLMConfig(BaseModel):
-    """Anthropic API settings."""
+class ClaudeConfig(BaseModel):
+    """Claude Code CLI settings."""
     model: str = "claude-sonnet-4-5-20250929"
-    max_tokens: int = 1024
-    temperature: float = 0.7
-    api_key: str = ""
+    max_turns: int = 5
+    timeout: int = 120
+    workspace_dir: str = "workspace"
+    mcp_config: str = ""
 
 
 class SessionConfig(BaseModel):
     """Session management settings."""
     idle_reset_minutes: int = 60
-    max_history_tokens: int = 50000
-    compaction_target_tokens: int = 10000
     storage_dir: str = "sessions"
 
 
@@ -54,7 +53,7 @@ class AutoReplyConfig(BaseModel):
     """Root configuration model."""
     bridge: BridgeConfig = BridgeConfig()
     daemon: DaemonConfig = DaemonConfig()
-    llm: LLMConfig = LLMConfig()
+    claude: ClaudeConfig = ClaudeConfig()
     session: SessionConfig = SessionConfig()
     pairing: PairingConfig = PairingConfig()
     security: SecurityConfig = SecurityConfig()
@@ -69,11 +68,6 @@ def load_config(config_path: str = "config.yaml") -> AutoReplyConfig:
             config_data = yaml.safe_load(f) or {}
 
     config = AutoReplyConfig(**config_data)
-
-    # Override API key from env
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if api_key:
-        config.llm.api_key = api_key
 
     # Override allowed recipients from env
     allowed_raw = os.environ.get("WHATSAPP_MCP_ALLOWED_RECIPIENT", "")

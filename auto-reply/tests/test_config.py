@@ -2,11 +2,10 @@
 # ABOUTME: Covers YAML loading, env var overrides, and Pydantic defaults.
 
 import os
-import tempfile
 import pytest
 import yaml
 
-from config import load_config, AutoReplyConfig, BridgeConfig
+from config import load_config, AutoReplyConfig
 
 
 class TestConfigDefaults:
@@ -14,7 +13,9 @@ class TestConfigDefaults:
         config = AutoReplyConfig()
         assert config.bridge.url == "http://localhost:8082/api"
         assert config.daemon.port == 8084
-        assert config.llm.model == "claude-sonnet-4-5-20250929"
+        assert config.claude.model == "claude-sonnet-4-5-20250929"
+        assert config.claude.max_turns == 5
+        assert config.claude.timeout == 120
         assert config.session.idle_reset_minutes == 60
         assert config.pairing.enabled is True
         assert config.security.block_groups is True
@@ -30,7 +31,7 @@ class TestConfigFromYAML:
         config_data = {
             "bridge": {"url": "http://custom:9999/api", "send_timeout": 30},
             "daemon": {"port": 9090},
-            "llm": {"model": "claude-haiku-4-5-20251001", "temperature": 0.5},
+            "claude": {"model": "claude-haiku-4-5-20251001", "max_turns": 3},
         }
         config_file = tmp_path / "test_config.yaml"
         config_file.write_text(yaml.dump(config_data))
@@ -39,8 +40,8 @@ class TestConfigFromYAML:
         assert config.bridge.url == "http://custom:9999/api"
         assert config.bridge.send_timeout == 30
         assert config.daemon.port == 9090
-        assert config.llm.model == "claude-haiku-4-5-20251001"
-        assert config.llm.temperature == 0.5
+        assert config.claude.model == "claude-haiku-4-5-20251001"
+        assert config.claude.max_turns == 3
 
     def test_load_missing_yaml_uses_defaults(self, tmp_path):
         config = load_config(str(tmp_path / "nonexistent.yaml"))
@@ -55,11 +56,6 @@ class TestConfigFromYAML:
 
 
 class TestConfigEnvOverrides:
-    def test_anthropic_api_key_from_env(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key-123")
-        config = load_config(str(tmp_path / "missing.yaml"))
-        assert config.llm.api_key == "sk-test-key-123"
-
     def test_allowed_recipients_from_env(self, tmp_path, monkeypatch):
         monkeypatch.setenv("WHATSAPP_MCP_ALLOWED_RECIPIENT",
                           "491732328586@s.whatsapp.net, 1732328586@s.whatsapp.net")
@@ -72,8 +68,3 @@ class TestConfigEnvOverrides:
         monkeypatch.setenv("WHATSAPP_MCP_ALLOWED_RECIPIENT", "  abc@s.whatsapp.net ,  def@lid  ")
         config = load_config(str(tmp_path / "missing.yaml"))
         assert config.security.allowed_recipients == ["abc@s.whatsapp.net", "def@lid"]
-
-    def test_empty_env_var_does_not_override(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "")
-        config = load_config(str(tmp_path / "missing.yaml"))
-        assert config.llm.api_key == ""

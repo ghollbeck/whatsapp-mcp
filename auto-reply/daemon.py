@@ -1,5 +1,5 @@
 # ABOUTME: Main entry point for the WhatsApp auto-reply daemon.
-# ABOUTME: Receives webhook notifications from Go bridge, orchestrates reply pipeline.
+# ABOUTME: Receives webhook notifications from Go bridge, spawns Claude Code sessions for replies.
 
 import asyncio
 import os
@@ -11,8 +11,7 @@ from aiohttp import web
 
 from config import load_config
 from pairing import PairingStore, ContactStatus
-from sessions import SessionManager, SessionMessage
-from llm import LLMClient
+from claude_runner import ClaudeRunner
 from chunker import ResponseChunker
 from bridge import BridgeClient
 
@@ -32,18 +31,12 @@ class AutoReplyDaemon:
             code_expiry_minutes=self.config.pairing.code_expiry_minutes,
             code_length=self.config.pairing.code_length
         )
-        self.sessions = SessionManager(
-            storage_dir=self.config.session.storage_dir,
-            idle_reset_minutes=self.config.session.idle_reset_minutes,
-            max_history_tokens=self.config.session.max_history_tokens,
-            compaction_target_tokens=self.config.session.compaction_target_tokens
-        )
-        self.llm = LLMClient(
-            api_key=self.config.llm.api_key,
-            model=self.config.llm.model,
-            max_tokens=self.config.llm.max_tokens,
-            temperature=self.config.llm.temperature,
-            persona_file=self.config.persona_file
+        self.claude = ClaudeRunner(
+            workspace_dir=self.config.claude.workspace_dir,
+            model=self.config.claude.model,
+            max_turns=self.config.claude.max_turns,
+            timeout=self.config.claude.timeout,
+            mcp_config=self.config.claude.mcp_config or None,
         )
         self.chunker = ResponseChunker(
             max_length=self.config.security.max_message_length
@@ -93,7 +86,6 @@ class AutoReplyDaemon:
         is_from_me = payload.get("is_from_me", False)
         is_group = payload.get("is_group", False)
         sender_name = payload.get("sender_name", "")
-        timestamp = payload.get("timestamp", datetime.now().isoformat())
         media_type = payload.get("media_type", "")
 
         # ── Security checks ──────────────────────────────────
@@ -115,12 +107,11 @@ class AutoReplyDaemon:
         # ── Sequential processing per sender ──────────────────
         async with self._sender_locks[sender_jid]:
             await self._process_message_locked(
-                sender_jid, content, sender_name, timestamp, media_type
+                sender_jid, content, sender_name, media_type
             )
 
     async def _process_message_locked(self, sender_jid: str, content: str,
-                                       sender_name: str, timestamp: str,
-                                       media_type: str):
+                                       sender_name: str, media_type: str):
         """Process a message with per-sender lock held."""
 
         # ── Pairing check ─────────────────────────────────────
@@ -161,59 +152,36 @@ class AutoReplyDaemon:
         if not content:
             return
 
-        # ── Session management ────────────────────────────────
-        session_key = self.sessions.get_or_create_session(sender_jid, sender_name)
-
-        # Add incoming message
-        self.sessions.add_message(session_key, SessionMessage(
-            role="user",
-            content=content,
-            timestamp=timestamp,
+        # ── Claude Code session ───────────────────────────────
+        reply = await self.claude.generate_reply(
             sender_jid=sender_jid,
-            sender_name=sender_name
-        ))
-
-        # Check compaction
-        if self.sessions.needs_compaction(session_key):
-            logger.info("session_needs_compaction", session_key=session_key)
-            history = self.sessions.get_history_as_api_messages(session_key)
-            summary = self.llm.generate_compaction_summary(history)
-            self.sessions.compact_session(session_key, summary)
-
-        # ── LLM call ──────────────────────────────────────────
-        history = self.sessions.get_history_as_api_messages(session_key)
-        reply = self.llm.generate_reply(history, sender_name)
+            message=content,
+            sender_name=sender_name,
+        )
 
         # ── Response delivery ─────────────────────────────────
         chunks = self.chunker.chunk(reply)
         results = await self.bridge.send_chunked(sender_jid, chunks)
 
         any_success = any(success for success, _ in results)
-
-        if any_success:
-            self.sessions.add_message(session_key, SessionMessage(
-                role="assistant",
-                content=reply,
-                timestamp=datetime.now().isoformat()
-            ))
-
         self._last_reply_time[sender_jid] = time.time()
 
         logger.info("reply_sent",
             sender=sender_jid,
             chunks=len(chunks),
             reply_length=len(reply),
+            session_id=self.claude.get_session_id(sender_jid),
             success=any_success)
 
     async def handle_health(self, request: web.Request) -> web.Response:
         bridge_ok = await self.bridge.health_check()
         return web.json_response({
             "status": "ok" if bridge_ok else "degraded",
-            "version": "0.1.0",
+            "version": "0.2.0",
             "bridge_connected": bridge_ok,
-            "model": self.config.llm.model,
+            "model": self.config.claude.model,
             "pairing_enabled": self.config.pairing.enabled,
-            "active_sessions": len(self.sessions.get_all_sessions())
+            "active_sessions": len(self.claude._session_map),
         })
 
 
@@ -224,7 +192,9 @@ def main():
     logger.info("starting_daemon",
         host=config.daemon.host,
         port=config.daemon.port,
-        model=config.llm.model,
+        model=config.claude.model,
+        max_turns=config.claude.max_turns,
+        workspace=config.claude.workspace_dir,
         pairing_enabled=config.pairing.enabled,
         allowed_recipients=config.security.allowed_recipients)
 

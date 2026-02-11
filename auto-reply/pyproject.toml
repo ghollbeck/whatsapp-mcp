@@ -1,10 +1,9 @@
 [project]
 name = "whatsapp-auto-reply"
-version = "0.1.0"
-description = "WhatsApp auto-reply gateway daemon"
+version = "0.2.0"
+description = "WhatsApp auto-reply gateway daemon (Claude Code powered)"
 requires-python = ">=3.11"
 dependencies = [
-    "anthropic>=0.40.0",
     "aiohttp>=3.9.0",
     "pydantic>=2.0.0",
     "pyyaml>=6.0",

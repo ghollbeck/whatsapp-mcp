@@ -1,3 +1,5 @@
+# WhatsApp Auto-Reply Daemon Configuration
+
 bridge:
   url: "http://localhost:8082/api"
   send_timeout: 10
@@ -6,17 +8,15 @@ daemon:
   host: "127.0.0.1"
   port: 8084
 
-llm:
+claude:
   model: "claude-sonnet-4-5-20250929"
-  max_tokens: 1024
-  temperature: 0.7
-  # api_key: set via ANTHROPIC_API_KEY env var
+  max_turns: 5
+  timeout: 120
+  workspace_dir: "workspace"
+  # mcp_config: ""  # Optional: path to additional MCP config JSON
 
 session:
   idle_reset_minutes: 60
-  max_history_tokens: 50000
-  compaction_target_tokens: 10000
-  storage_dir: "sessions"
 
 pairing:
   enabled: true
@@ -28,5 +28,3 @@ security:
   rate_limit_seconds: 5.0
   max_message_length: 4096
   # allowed_recipients: set via WHATSAPP_MCP_ALLOWED_RECIPIENT env var
-
-persona_file: "PERSONA.md"

@@ -1,5 +1,5 @@
 # ABOUTME: Integration tests for the auto-reply daemon webhook handler.
-# ABOUTME: Tests the full webhook pipeline with mocked LLM and bridge dependencies.
+# ABOUTME: Tests the full webhook pipeline with mocked Claude runner and bridge.
 
 import json
 import asyncio
@@ -7,7 +7,6 @@ import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from aiohttp import web
-from aiohttp.test_utils import AioHTTPTestCase
 
 from daemon import AutoReplyDaemon
 
@@ -17,10 +16,19 @@ def config_dir(tmp_path):
     """Create a temp config directory with all required files."""
     import yaml
 
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "CLAUDE.md").write_text("Test assistant.")
+
     config_data = {
         "bridge": {"url": "http://localhost:19999/api", "send_timeout": 2},
         "daemon": {"port": 18084},
-        "llm": {"model": "test-model", "api_key": "sk-test"},
+        "claude": {
+            "model": "test-model",
+            "max_turns": 3,
+            "timeout": 10,
+            "workspace_dir": str(workspace),
+        },
         "session": {
             "storage_dir": str(tmp_path / "sessions"),
             "idle_reset_minutes": 60,
@@ -32,16 +40,12 @@ def config_dir(tmp_path):
     config_file = tmp_path / "config.yaml"
     config_file.write_text(yaml.dump(config_data))
 
-    persona_file = tmp_path / "PERSONA.md"
-    persona_file.write_text("You are a test assistant.")
-
     return tmp_path, str(config_file)
 
 
 @pytest.fixture
 def daemon(config_dir, monkeypatch):
     tmp_path, config_path = config_dir
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
     monkeypatch.chdir(tmp_path)
     d = AutoReplyDaemon(config_path=config_path)
     return d
@@ -110,7 +114,6 @@ class TestMessageProcessing:
             "is_from_me": True,
             "is_group": False,
         }
-        # Should return immediately without error
         await daemon.process_message(payload)
 
     @pytest.mark.asyncio
@@ -122,16 +125,12 @@ class TestMessageProcessing:
             "is_group": True,
         }
         await daemon.process_message(payload)
-        # No error means it was silently dropped
 
     @pytest.mark.asyncio
     async def test_processes_valid_message(self, daemon):
-        # Patch the LLM and bridge to avoid real API calls
-        daemon.llm.generate_reply = MagicMock(return_value="Test reply")
-        daemon.bridge.send_message = AsyncMock(return_value=(True, "Sent"))
-        daemon.bridge.send_chunked = AsyncMock(
-            return_value=[(True, "Sent")]
-        )
+        # Patch Claude runner and bridge
+        daemon.claude.generate_reply = AsyncMock(return_value="Test reply from Claude Code")
+        daemon.bridge.send_chunked = AsyncMock(return_value=[(True, "Sent")])
 
         payload = {
             "sender_jid": "user@s.whatsapp.net",
@@ -139,22 +138,23 @@ class TestMessageProcessing:
             "content": "Hello, testing!",
             "is_from_me": False,
             "is_group": False,
-            "timestamp": "2026-02-11T12:00:00",
         }
         await daemon.process_message(payload)
 
-        # LLM should have been called
-        daemon.llm.generate_reply.assert_called_once()
+        # Claude runner should have been called with the message
+        daemon.claude.generate_reply.assert_called_once_with(
+            sender_jid="user@s.whatsapp.net",
+            message="Hello, testing!",
+            sender_name="Test User",
+        )
 
         # Bridge should have sent the response
         daemon.bridge.send_chunked.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_handles_media_message(self, daemon):
-        daemon.llm.generate_reply = MagicMock(return_value="I see you sent an image!")
-        daemon.bridge.send_chunked = AsyncMock(
-            return_value=[(True, "Sent")]
-        )
+        daemon.claude.generate_reply = AsyncMock(return_value="I see you sent an image!")
+        daemon.bridge.send_chunked = AsyncMock(return_value=[(True, "Sent")])
 
         payload = {
             "sender_jid": "user@s.whatsapp.net",
@@ -162,14 +162,12 @@ class TestMessageProcessing:
             "media_type": "image",
             "is_from_me": False,
             "is_group": False,
-            "timestamp": "2026-02-11T12:00:00",
         }
         await daemon.process_message(payload)
 
-        # LLM should have received the media placeholder
-        call_args = daemon.llm.generate_reply.call_args
-        messages = call_args[0][0]
-        assert any("[Sent a image message]" in m.get("content", "") for m in messages)
+        # Claude runner should have received the media placeholder
+        call_args = daemon.claude.generate_reply.call_args
+        assert "[Sent a image message]" in call_args.kwargs.get("message", call_args[1].get("message", ""))
 
 
 class TestHealthEndpoint:
@@ -181,7 +179,8 @@ class TestHealthEndpoint:
         assert resp.status == 200
         data = await resp.json()
         assert data["status"] == "ok"
-        assert "version" in data
+        assert data["version"] == "0.2.0"
+        assert "model" in data
 
     @pytest.mark.asyncio
     async def test_health_degraded_when_bridge_down(self, daemon, aiohttp_client):
