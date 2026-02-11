@@ -1,3 +1,21 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# Go binaries
+whatsapp-bridge/bridge
+whatsapp-bridge/whatsapp-bridge
+whatsapp-bridge/whatsapp-client
+whatsapp-bridge/store/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Auto-reply runtime data
+auto-reply/sessions/
+auto-reply/store/
+auto-reply/.venv/
+auto-reply/.pytest_cache/

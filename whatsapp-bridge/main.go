@@ -31,6 +31,60 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// Auto-reply webhook configuration
+var webhookURL = os.Getenv("AUTOREPLY_WEBHOOK_URL")
+var webhookSecret = os.Getenv("AUTOREPLY_WEBHOOK_SECRET")
+
+// WebhookPayload is sent to the auto-reply daemon on incoming messages
+type WebhookPayload struct {
+	MessageID   string `json:"message_id"`
+	ChatJID     string `json:"chat_jid"`
+	SenderJID   string `json:"sender_jid"`
+	SenderName  string `json:"sender_name"`
+	Content     string `json:"content"`
+	Timestamp   string `json:"timestamp"`
+	IsFromMe    bool   `json:"is_from_me"`
+	IsGroup     bool   `json:"is_group"`
+	MediaType   string `json:"media_type,omitempty"`
+	Filename    string `json:"filename,omitempty"`
+}
+
+func sendWebhookNotification(payload WebhookPayload) {
+	if webhookURL == "" {
+		return
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Printf("[WEBHOOK] Failed to marshal payload: %v\n", err)
+		return
+	}
+
+	go func() {
+		client := &http.Client{Timeout: 5 * time.Second}
+		req, err := http.NewRequest("POST", webhookURL, bytes.NewBuffer(jsonData))
+		if err != nil {
+			fmt.Printf("[WEBHOOK] Failed to create request: %v\n", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if webhookSecret != "" {
+			req.Header.Set("X-Webhook-Secret", webhookSecret)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("[WEBHOOK] Failed to send notification: %v\n", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("[WEBHOOK] Daemon returned status %d\n", resp.StatusCode)
+		}
+	}()
+}
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -90,6 +144,15 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Migration: add reply-to columns (SQLite doesn't support IF NOT EXISTS for ALTER TABLE)
+	for _, col := range []string{
+		"ALTER TABLE messages ADD COLUMN reply_to_id TEXT",
+		"ALTER TABLE messages ADD COLUMN reply_to_sender TEXT",
+		"ALTER TABLE messages ADD COLUMN reply_to_text TEXT",
+	} {
+		_, _ = db.Exec(col) // ignore "duplicate column" errors
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -109,17 +172,19 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	replyToID, replyToSender, replyToText string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, reply_to_id, reply_to_sender, reply_to_text)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		replyToID, replyToSender, replyToText,
 	)
 	return err
 }
@@ -187,6 +252,34 @@ func extractTextContent(msg *waProto.Message) string {
 
 	// For now, we're ignoring non-text messages
 	return ""
+}
+
+// Extract reply/quote context info from a message
+func extractContextInfo(msg *waProto.Message) (replyToID, replyToSender, replyToText string) {
+	if msg == nil {
+		return
+	}
+	var ci *waProto.ContextInfo
+	if ext := msg.GetExtendedTextMessage(); ext != nil {
+		ci = ext.GetContextInfo()
+	} else if img := msg.GetImageMessage(); img != nil {
+		ci = img.GetContextInfo()
+	} else if vid := msg.GetVideoMessage(); vid != nil {
+		ci = vid.GetContextInfo()
+	} else if aud := msg.GetAudioMessage(); aud != nil {
+		ci = aud.GetContextInfo()
+	} else if doc := msg.GetDocumentMessage(); doc != nil {
+		ci = doc.GetContextInfo()
+	}
+	if ci == nil {
+		return
+	}
+	replyToID = ci.GetStanzaID()
+	replyToSender = ci.GetParticipant()
+	if qm := ci.GetQuotedMessage(); qm != nil {
+		replyToText = extractTextContent(qm)
+	}
+	return
 }
 
 // SendMessageResponse represents the response for the send message API
@@ -429,6 +522,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
+	// Extract reply/quote context info
+	replyToID, replyToSender, replyToText := extractContextInfo(msg.Message)
+
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
 		return
@@ -449,11 +545,31 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		replyToID,
+		replyToSender,
+		replyToText,
 	)
 
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
 	} else {
+		// Notify auto-reply daemon (skip own messages)
+		if !msg.Info.IsFromMe {
+			isGroup := msg.Info.Chat.Server == "g.us"
+			sendWebhookNotification(WebhookPayload{
+				MessageID:  msg.Info.ID,
+				ChatJID:    chatJID,
+				SenderJID:  msg.Info.Sender.String(),
+				SenderName: name,
+				Content:    content,
+				Timestamp:  msg.Info.Timestamp.Format(time.RFC3339),
+				IsFromMe:   false,
+				IsGroup:    isGroup,
+				MediaType:  mediaType,
+				Filename:   filename,
+			})
+		}
+
 		// Log message reception
 		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
 		direction := "←"
@@ -905,8 +1021,8 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Start REST API server (port 8082 to avoid conflict with TS MCP on 8080)
+	startRESTServer(client, messageStore, 8082)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -1072,6 +1188,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
 				}
 
+				// Extract reply/quote context info
+				var replyToID, replyToSender, replyToText string
+				if msg.Message.Message != nil {
+					replyToID, replyToSender, replyToText = extractContextInfo(msg.Message.Message)
+				}
+
 				// Log the message content for debugging
 				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
 
@@ -1126,6 +1248,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					replyToID,
+					replyToSender,
+					replyToText,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
